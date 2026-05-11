@@ -29,6 +29,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import android.media.MediaCodecList;
 
 class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
     private static final String TAG = "VideoFileRenderer";
@@ -54,12 +55,109 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
     private MediaCodec encoder;
     private final MediaCodec.BufferInfo bufferInfo;
     private MediaCodec.BufferInfo audioBufferInfo;
-    private int trackIndex = -1;
-    private int audioTrackIndex;
+    private volatile int trackIndex = -1;
+    private volatile int audioTrackIndex;
     private boolean isRunning = true;
     private GlRectDrawer drawer;
     private Surface surface;
     private MediaCodec audioEncoder;
+    // Name of the first encoder that advertises COLOR_FormatSurface support.
+    // On Qualcomm devices OMX.qcom.video.encoder.avc rejects COLOR_FormatSurface
+    // with error -38, so we must explicitly select a surface-capable codec.
+    private String preferredEncoderName = null;
+
+    /**
+     * Returns the name of an encoder that both advertises and actually accepts
+     * COLOR_FormatSurface at configure time, or null if none is found.
+     *
+     * Some HW encoders (e.g. OMX.qcom.video.encoder.avc on Qualcomm/Xiaomi) claim
+     * COLOR_FormatSurface in their caps but reject it at configure time (error -38).
+     * We perform a lightweight test-configure to verify real support before committing.
+     *
+     * Uses ALL_CODECS to expose SW encoders (e.g. c2.android.avc.encoder) that may
+     * not appear in REGULAR_CODECS on some vendor ROMs.
+     * SW encoders (c2.android.*, OMX.google.*) are tried before HW encoders.
+     */
+    private static String findEncoderSupportingSurface() {
+        MediaCodecInfo[] codecs;
+        try {
+            codecs = new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos();
+        } catch (Exception e) {
+            Log.w(TAG, "Error getting codec list: " + e.getMessage());
+            return null;
+        }
+
+        List<String> swCandidates = new ArrayList<>();
+        List<String> hwCandidates = new ArrayList<>();
+
+        for (MediaCodecInfo info : codecs) {
+            if (!info.isEncoder()) continue;
+            boolean supportsMime = false;
+            for (String type : info.getSupportedTypes()) {
+                if (type.equalsIgnoreCase(MIME_TYPE)) { supportsMime = true; break; }
+            }
+            if (!supportsMime) continue;
+            try {
+                MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(MIME_TYPE);
+                boolean hasSurface = false;
+                for (int fmt : caps.colorFormats) {
+                    if (fmt == MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface) {
+                        hasSurface = true;
+                        break;
+                    }
+                }
+                if (!hasSurface) continue;
+                String name = info.getName();
+                boolean isSoftware = name.startsWith("c2.android.") || name.startsWith("OMX.google.");
+                if (isSoftware) {
+                    swCandidates.add(name);
+                } else {
+                    hwCandidates.add(name);
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // Try SW first, then HW — verify each with a real configure test
+        List<String> ordered = new ArrayList<>(swCandidates);
+        ordered.addAll(hwCandidates);
+
+        for (String name : ordered) {
+            if (testSurfaceEncoderConfigure(name)) {
+                boolean sw = name.startsWith("c2.android.") || name.startsWith("OMX.google.");
+                Log.d(TAG, "Found " + (sw ? "SW" : "HW") + " encoder supporting COLOR_FormatSurface: " + name);
+                return name;
+            }
+        }
+
+        Log.w(TAG, "No working encoder found for COLOR_FormatSurface — falling back to createEncoderByType");
+        return null;
+    }
+
+    /**
+     * Attempts a minimal configure with COLOR_FormatSurface to verify the codec
+     * actually accepts surface input (not just claims to). Returns true on success.
+     */
+    private static boolean testSurfaceEncoderConfigure(String codecName) {
+        MediaCodec testCodec = null;
+        try {
+            testCodec = MediaCodec.createByCodecName(codecName);
+            MediaFormat testFormat = MediaFormat.createVideoFormat(MIME_TYPE, 320, 240);
+            testFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+            testFormat.setInteger(MediaFormat.KEY_BIT_RATE, 500000);
+            testFormat.setInteger(MediaFormat.KEY_FRAME_RATE, 15);
+            testFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+            testCodec.configure(testFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            return true; // configure succeeded — codec is usable
+        } catch (Exception e) {
+            Log.d(TAG, "Encoder " + codecName + " failed surface configure test: " + e.getMessage());
+            return false;
+        } finally {
+            if (testCodec != null) {
+                try { testCodec.release(); } catch (Exception ignored) {}
+            }
+        }
+    }
 
     VideoFileRenderer(String outputFile, final EglBase.Context sharedContext, boolean withAudio) throws IOException {
         renderThread = new HandlerThread(TAG + "RenderThread");
@@ -97,7 +195,11 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
 
             Log.d(TAG, "Trying encoder config: " + config);
 
-            encoder = MediaCodec.createEncoderByType(MIME_TYPE);
+            if (preferredEncoderName != null) {
+                encoder = MediaCodec.createByCodecName(preferredEncoderName);
+            } else {
+                encoder = MediaCodec.createEncoderByType(MIME_TYPE);
+            }
             String codecName = encoder.getName();
             Log.d(TAG, "Codec name: " + codecName);
             if ("OMX.hisi.video.encoder.avc".equals(codecName)) {
@@ -224,12 +326,24 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
             surface = null;
         }
 
-        // Check codec capabilities
+        // Select the encoder that supports COLOR_FormatSurface.
+        // OMX.qcom.video.encoder.avc (Qualcomm HW) rejects COLOR_FormatSurface;
+        // we must find a codec that explicitly supports it before iterating configs.
+        if (preferredEncoderName == null) {
+            preferredEncoderName = findEncoderSupportingSurface();
+        }
+
+        // Check codec capabilities using the preferred encoder (or the default one).
         MediaCodecInfo codecInfo = null;
         try {
-            MediaCodec codec = MediaCodec.createEncoderByType(MIME_TYPE);
-            codecInfo = codec.getCodecInfo();
-            codec.release();
+            MediaCodec probe;
+            if (preferredEncoderName != null) {
+                probe = MediaCodec.createByCodecName(preferredEncoderName);
+            } else {
+                probe = MediaCodec.createEncoderByType(MIME_TYPE);
+            }
+            codecInfo = probe.getCodecInfo();
+            probe.release();
         } catch (Exception e) {
             Log.e(TAG, "Failed to get codec info: " + e.getMessage());
         }
@@ -277,7 +391,8 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
                 try {
                     latch.await();
                 } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+                    // Do NOT re-interrupt the thread — it would cause all subsequent latch.await()
+                    // calls to throw immediately, cascading failure across all remaining configs.
                     Log.e(TAG, "Interrupted while awaiting EGL setup: " + e.getMessage());
                 }
                 if (encoderStarted) {
@@ -287,6 +402,9 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
         }
 
         Log.e(TAG, "Failed to configure and start encoder with any supported configuration.");
+        // Reset state so the next incoming frame can retry initialization.
+        outputFileWidth = -1;
+        encoderInitializing = false;
     }
     @Override
     public void onFrame(VideoFrame frame) {
@@ -297,7 +415,13 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
             int frameHeight = frame.getRotatedHeight();
             initVideoEncoder(frameWidth, frameHeight);
         }
-        renderThreadHandler.post(() -> renderFrameOnRenderThread(frame));
+        // Only post to the render thread once the encoder and EGL drawer are fully ready.
+        // Posting before encoderStarted is true means drawer == null, causing dropped frames.
+        if (encoderStarted) {
+            renderThreadHandler.post(() -> renderFrameOnRenderThread(frame));
+        } else {
+            frame.release();
+        }
     }
 
     private void renderFrameOnRenderThread(VideoFrame frame) {
@@ -385,12 +509,18 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
                 MediaFormat newFormat = encoder.getOutputFormat();
 
                 Log.e(TAG, "encoder output format changed: " + newFormat);
-                trackIndex = mediaMuxer.addTrack(newFormat);
+                synchronized (mediaMuxer) {
+                    trackIndex = mediaMuxer.addTrack(newFormat);
+                }
                 // Start Signify modification
-                if (trackIndex != -1 && audioTrackIndex != -1 && !muxerStarted) {
+                
+                synchronized (mediaMuxer) {
+                    if (trackIndex != -1 && audioTrackIndex != -1 && !muxerStarted) {
                 // End Signify modification
-                    mediaMuxer.start();
-                    muxerStarted = true;
+
+                        mediaMuxer.start();
+                        muxerStarted = true;
+                    }
                 }
                 if (!muxerStarted)
                     break;
@@ -411,7 +541,7 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
                     }
                     bufferInfo.presentationTimeUs -= videoFrameStart;
                     if (muxerStarted)
-                        mediaMuxer.writeSampleData(trackIndex, encodedData, bufferInfo);
+                        synchronized (mediaMuxer) { mediaMuxer.writeSampleData(trackIndex, encodedData, bufferInfo); }
                     isRunning = isRunning && (bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0;
                     encoder.releaseOutputBuffer(encoderStatus, false);
                     if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -447,12 +577,16 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
                 MediaFormat newFormat = audioEncoder.getOutputFormat();
 
                 Log.w(TAG, "encoder output format changed: " + newFormat);
-                audioTrackIndex = mediaMuxer.addTrack(newFormat);
+                synchronized (mediaMuxer) {
+                    audioTrackIndex = mediaMuxer.addTrack(newFormat);
+                }
                 // Start Signify modification
-                if (trackIndex != -1 && audioTrackIndex != -1 && !muxerStarted) {
+                synchronized (mediaMuxer) {
+                    if (trackIndex != -1 && audioTrackIndex != -1 && !muxerStarted) {
                 // End Signify modification
-                    mediaMuxer.start();
-                    muxerStarted = true;
+                        mediaMuxer.start();
+                        muxerStarted = true;
+                    }
                 }
                 if (!muxerStarted)
                     break;
@@ -472,7 +606,7 @@ class VideoFileRenderer implements VideoSink, SamplesReadyCallback {
                     encodedData.limit(audioBufferInfo.offset + audioBufferInfo.size);
 
                     if (muxerStarted)
-                        mediaMuxer.writeSampleData(audioTrackIndex, encodedData, audioBufferInfo);
+                        synchronized (mediaMuxer) { mediaMuxer.writeSampleData(audioTrackIndex, encodedData, audioBufferInfo); }
 
                     isRunning = isRunning && (audioBufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0;
                     audioEncoder.releaseOutputBuffer(encoderStatus, false);
