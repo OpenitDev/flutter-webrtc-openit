@@ -1,6 +1,10 @@
 
 # Changelog
 
+[Unreleased]
+
+* [iOS] Open the broadcast picker through public UIKit control events instead of a private ReplayKit selector. Audio/video calls and manual broadcast capture are unchanged.
+
 [1.4.1] -2026-03-24
 
 * [Dart] fixed scalabilityMode (#2022).

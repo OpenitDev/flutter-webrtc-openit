@@ -71,9 +71,12 @@ NSArray<RTCDesktopSource*>* _captureSources;
     } else {
       NSLog(@"Not able to find the %@ key", kRTCScreenSharingExtension);
     }
-    SEL selector = NSSelectorFromString(@"buttonPressed:");
-    if ([picker respondsToSelector:selector]) {
-      [picker performSelector:selector withObject:nil];
+    // Use UIKit's public control events instead of a private ReplayKit selector.
+    for (UIView* subview in picker.subviews) {
+      if ([subview isKindOfClass:[UIButton class]]) {
+        [(UIButton*)subview sendActionsForControlEvents:UIControlEventTouchUpInside];
+        break;
+      }
     }
   }
 #endif
